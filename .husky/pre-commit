@@ -1,0 +1,5 @@
+pre-commit run
+
+if git diff --cached --name-only | grep -E '\.(js|ts|jsx|tsx)$' > /dev/null; then
+  npm run lint
+fi
