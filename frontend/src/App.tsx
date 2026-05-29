@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ChangeEvent, FormEvent } from "react";
+import type { CSSProperties, ChangeEvent, DragEvent, FormEvent } from "react";
 import "./index.css";
 
 const API_BASE = (import.meta.env.VITE_API_BASE?.trim() ?? "").replace(
@@ -7,6 +7,23 @@ const API_BASE = (import.meta.env.VITE_API_BASE?.trim() ?? "").replace(
   "",
 );
 const MAX_DURATION_SECONDS = 60;
+const DOWNLOAD_PROGRESS_FALLBACK_STEPS = 4;
+const ACCEPTED_MEDIA_TYPES =
+  "audio/*,video/mp4,video/quicktime,.m4a,.mp4,.mov,.aac,.wav,.mp3,.flac,.ogg,.webm";
+const ACCEPTED_MEDIA_EXTENSIONS = new Set([
+  ".aac",
+  ".aif",
+  ".aiff",
+  ".flac",
+  ".m4a",
+  ".mov",
+  ".mp3",
+  ".mp4",
+  ".ogg",
+  ".opus",
+  ".wav",
+  ".webm",
+]);
 const STEM_ORDER = ["vocals", "drums", "bass", "other"] as const;
 const STATUS_POLL_INTERVAL_MS = 2_000;
 const STATUS_TIMEOUT_MS = 20 * 60 * 1_000;
@@ -28,6 +45,12 @@ type UploadStatus =
   | "complete"
   | "error";
 type JobStatus = "queued" | "processing" | "complete" | "error";
+
+type DownloadProgress = {
+  completed: number;
+  total: number;
+  currentStem: string | null;
+};
 
 type JobStatusResponse = {
   job_id?: string;
@@ -52,6 +75,20 @@ const formatBytes = (bytes: number) => {
 
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 };
+
+const fileExtension = (filename: string) => {
+  const extension = filename.toLowerCase().match(/\.[^.]+$/);
+  return extension?.[0] ?? "";
+};
+
+const isAcceptedMediaFile = (file: File) =>
+  file.type.startsWith("audio/") ||
+  file.type === "video/mp4" ||
+  file.type === "video/quicktime" ||
+  ACCEPTED_MEDIA_EXTENSIONS.has(fileExtension(file.name));
+
+const hasDraggedFiles = (dataTransfer: DataTransfer) =>
+  Array.from(dataTransfer.types).includes("Files");
 
 const formatPlaybackTime = (seconds: number) => {
   if (!Number.isFinite(seconds) || seconds <= 0) {
@@ -226,23 +263,27 @@ const waitForJobCompletion = async (jobId: string) => {
   throw new Error("Timed out waiting for the backend to finish this stem job.");
 };
 
-const validateAudioDuration = (file: File) =>
+const validateMediaDuration = (file: File) =>
   new Promise<number>((resolve, reject) => {
-    const audio = new Audio();
+    const media = document.createElement(
+      file.type.startsWith("video/") ? "video" : "audio",
+    );
     const objectUrl = URL.createObjectURL(file);
 
-    audio.preload = "metadata";
-    audio.onloadedmetadata = () => {
+    media.preload = "metadata";
+    media.onloadedmetadata = () => {
       URL.revokeObjectURL(objectUrl);
-      resolve(audio.duration);
+      resolve(media.duration);
     };
-    audio.onerror = () => {
+    media.onerror = () => {
       URL.revokeObjectURL(objectUrl);
       reject(
-        new Error("Unable to read this audio file. Please try another clip."),
+        new Error(
+          "Unable to read this media file. Try an MP3, M4A, MP4, WAV, FLAC, or another ffmpeg-compatible clip.",
+        ),
       );
     };
-    audio.src = objectUrl;
+    media.src = objectUrl;
   });
 
 export default function App() {
@@ -256,7 +297,14 @@ export default function App() {
   const [playbackTime, setPlaybackTime] = useState(0);
   const [playbackDuration, setPlaybackDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isDraggingMedia, setIsDraggingMedia] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState<DownloadProgress>({
+    completed: 0,
+    total: 0,
+    currentStem: null,
+  });
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
+  const dragDepth = useRef(0);
   const stemObjectUrls = useRef<string[]>([]);
 
   const releaseDownloadedStemUrls = useCallback(() => {
@@ -272,26 +320,88 @@ export default function App() {
   const downloadStemAudio = useCallback(
     async (tracks: StemTrack[]) => {
       const downloadedUrls: string[] = [];
+      const downloadedTracks: StemTrack[] = [];
+
+      setDownloadProgress({
+        completed: 0,
+        total: tracks.length,
+        currentStem: null,
+      });
 
       try {
-        const downloadedTracks = await Promise.all(
-          tracks.map(async (track) => {
-            const response = await fetch(track.url);
+        for (const [index, track] of tracks.entries()) {
+          const completedBeforeTrack = index;
+          setDownloadProgress({
+            completed: completedBeforeTrack,
+            total: tracks.length,
+            currentStem: track.name,
+          });
 
-            if (!response.ok) {
-              throw new Error(
-                `Could not download ${track.name} with status ${response.status}.`,
-              );
+          const response = await fetch(track.url);
+
+          if (!response.ok) {
+            throw new Error(
+              `Could not download ${track.name} with status ${response.status}.`,
+            );
+          }
+
+          const contentLength = Number(response.headers.get("content-length"));
+          const body = response.body;
+          let blob: Blob;
+
+          if (body && Number.isFinite(contentLength) && contentLength > 0) {
+            const reader = body.getReader();
+            const chunks: BlobPart[] = [];
+            let receivedBytes = 0;
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) {
+                break;
+              }
+
+              if (value) {
+                chunks.push(value);
+                receivedBytes += value.byteLength;
+                setDownloadProgress({
+                  completed:
+                    completedBeforeTrack + receivedBytes / contentLength,
+                  total: tracks.length,
+                  currentStem: track.name,
+                });
+              }
             }
 
-            const objectUrl = URL.createObjectURL(await response.blob());
-            downloadedUrls.push(objectUrl);
-            return { ...track, url: objectUrl };
-          }),
-        );
+            blob = new Blob(chunks, {
+              type: response.headers.get("content-type") ?? "audio/mpeg",
+            });
+          } else {
+            setDownloadProgress({
+              completed:
+                completedBeforeTrack + 1 / DOWNLOAD_PROGRESS_FALLBACK_STEPS,
+              total: tracks.length,
+              currentStem: track.name,
+            });
+            blob = await response.blob();
+          }
+
+          const objectUrl = URL.createObjectURL(blob);
+          downloadedUrls.push(objectUrl);
+          downloadedTracks.push({ ...track, url: objectUrl });
+          setDownloadProgress({
+            completed: index + 1,
+            total: tracks.length,
+            currentStem: track.name,
+          });
+        }
 
         releaseDownloadedStemUrls();
         stemObjectUrls.current = downloadedUrls;
+        setDownloadProgress({
+          completed: tracks.length,
+          total: tracks.length,
+          currentStem: null,
+        });
         return downloadedTracks;
       } catch (downloadError) {
         for (const objectUrl of downloadedUrls) {
@@ -371,8 +481,9 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [getStemPlayers, isPlaying, stems.length, syncPlaybackPosition]);
 
-  const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = event.target.files?.[0] ?? null;
+  const handleMediaFile = async (selectedFile: File | null) => {
+    dragDepth.current = 0;
+    setIsDraggingMedia(false);
     setError("");
     releaseDownloadedStemUrls();
     setStems([]);
@@ -388,16 +499,18 @@ export default function App() {
       return;
     }
 
-    if (!selectedFile.type.startsWith("audio/")) {
+    if (!isAcceptedMediaFile(selectedFile)) {
       setFile(null);
       setDuration(null);
       setStatus("error");
-      setError("Please upload a valid audio file.");
+      setError(
+        "Please upload an audio or video file that can be converted to MP3.",
+      );
       return;
     }
 
     try {
-      const selectedDuration = await validateAudioDuration(selectedFile);
+      const selectedDuration = await validateMediaDuration(selectedFile);
       if (selectedDuration > MAX_DURATION_SECONDS + 0.25) {
         setFile(null);
         setDuration(selectedDuration);
@@ -421,6 +534,53 @@ export default function App() {
     }
   };
 
+  const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    void handleMediaFile(event.target.files?.[0] ?? null);
+  };
+
+  const handleDropZoneDragEnter = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (isBusy || !hasDraggedFiles(event.dataTransfer)) {
+      return;
+    }
+
+    dragDepth.current += 1;
+    event.dataTransfer.dropEffect = "copy";
+    setIsDraggingMedia(true);
+  };
+
+  const handleDropZoneDragOver = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (!isBusy && hasDraggedFiles(event.dataTransfer)) {
+      event.dataTransfer.dropEffect = "copy";
+    }
+  };
+
+  const handleDropZoneDragLeave = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) {
+      setIsDraggingMedia(false);
+    }
+  };
+
+  const handleDropZoneDrop = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (isBusy) {
+      return;
+    }
+
+    void handleMediaFile(event.dataTransfer.files.item(0));
+  };
+
   const handleStemAudio = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -437,6 +597,7 @@ export default function App() {
     setPlaybackTime(0);
     setPlaybackDuration(0);
     setIsPlaying(false);
+    setDownloadProgress({ completed: 0, total: 0, currentStem: null });
 
     const nextJobId = createJobId();
     const formData = new FormData();
@@ -494,11 +655,24 @@ export default function App() {
     setPlaybackDuration(0);
     setVolumes({});
     setIsPlaying(false);
+    setIsDraggingMedia(false);
+    dragDepth.current = 0;
+    setDownloadProgress({ completed: 0, total: 0, currentStem: null });
     audioRefs.current = {};
   };
 
   const isBusy =
     status === "queued" || status === "processing" || status === "downloading";
+  const downloadPercent =
+    downloadProgress.total > 0
+      ? Math.min(
+          100,
+          Math.max(
+            0,
+            (downloadProgress.completed / downloadProgress.total) * 100,
+          ),
+        )
+      : 0;
 
   const togglePlayback = async () => {
     const players = getStemPlayers();
@@ -587,19 +761,33 @@ export default function App() {
 
         {status !== "complete" ? (
           <form className="upload-panel" onSubmit={handleStemAudio}>
-            <label className="drop-zone">
+            <label
+              className={
+                isDraggingMedia ? "drop-zone drop-zone--dragging" : "drop-zone"
+              }
+              onDragEnter={handleDropZoneDragEnter}
+              onDragLeave={handleDropZoneDragLeave}
+              onDragOver={handleDropZoneDragOver}
+              onDrop={handleDropZoneDrop}
+            >
               <input
                 type="file"
-                accept="audio/*"
+                accept={ACCEPTED_MEDIA_TYPES}
                 onChange={handleFileChange}
                 disabled={isBusy}
               />
               <span className="drop-icon">♫</span>
-              <strong>{file ? file.name : "Drop in an audio clip"}</strong>
+              <strong>
+                {file
+                  ? file.name
+                  : isDraggingMedia
+                    ? "Release to upload this clip"
+                    : "Drop in an audio or video clip"}
+              </strong>
               <small>
                 {file
                   ? `${durationLabel} selected`
-                  : "WAV, MP3, M4A, FLAC • 60 seconds max"}
+                  : "MP3, M4A, MP4, WAV, FLAC, OGG • 60 seconds max"}
               </small>
               <span className="wave-preview" aria-hidden="true">
                 {Array.from({ length: 22 }).map((_, index) => (
@@ -771,9 +959,31 @@ export default function App() {
               </strong>
               <span>
                 {status === "downloading"
-                  ? "The stems are ready. We are downloading them now and will unlock playback once all four tracks are local."
+                  ? downloadProgress.currentStem
+                    ? `Downloading ${downloadProgress.currentStem} stem for playback.`
+                    : "The stems are ready. Preparing local playback now."
                   : `Job ${jobId?.slice(0, 8) ?? "pending"} is running in the background. Keep this tab open while the backend renders each stem.`}
               </span>
+              {status === "downloading" ? (
+                <div
+                  className="download-progress"
+                  aria-label="Stem download progress"
+                  aria-valuemax={100}
+                  aria-valuemin={0}
+                  aria-valuenow={Math.round(downloadPercent)}
+                  role="progressbar"
+                >
+                  <span
+                    className="download-progress__bar"
+                    style={
+                      {
+                        "--download-progress": `${downloadPercent}%`,
+                      } as CSSProperties
+                    }
+                  />
+                  <small>{Math.round(downloadPercent)}% downloaded</small>
+                </div>
+              ) : null}
             </div>
           </div>
         ) : null}
