@@ -1,8 +1,24 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ChangeEvent, FormEvent } from "react";
 import "./index.css";
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8001";
+const PUBLIC_API_PORT = "5000";
+
+const getPublicApiBase = () => {
+  const configuredBase = import.meta.env.VITE_API_BASE?.trim();
+
+  if (configuredBase) {
+    return configuredBase.replace(/\/$/, "");
+  }
+
+  if (typeof window === "undefined") {
+    return `http://localhost:${PUBLIC_API_PORT}`;
+  }
+
+  return `${window.location.protocol}//${window.location.hostname}:${PUBLIC_API_PORT}`;
+};
+
+const API_BASE = getPublicApiBase();
 const MAX_DURATION_SECONDS = 60;
 const STEM_ORDER = ["vocals", "drums", "bass", "other"] as const;
 const STATUS_POLL_INTERVAL_MS = 2_000;
@@ -49,6 +65,19 @@ const formatBytes = (bytes: number) => {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 };
 
+const formatPlaybackTime = (seconds: number) => {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "0:00";
+  }
+
+  const wholeSeconds = Math.floor(seconds);
+  return `${Math.floor(wholeSeconds / 60)}:${(wholeSeconds % 60)
+    .toString()
+    .padStart(2, "0")}`;
+};
+
+const getApiUrl = (path: string) => `${API_BASE}/${path.replace(/^\//, "")}`;
+
 const extractUrl = (value: unknown): string | null => {
   if (typeof value === "string") {
     return value;
@@ -69,15 +98,16 @@ const extractUrl = (value: unknown): string | null => {
 };
 
 const toPlayableUrl = (value: string) => {
-  if (
-    value.startsWith("http") ||
-    value.startsWith("blob:") ||
-    value.startsWith("data:")
-  ) {
+  if (value.startsWith("blob:") || value.startsWith("data:")) {
     return value;
   }
 
-  return `${API_BASE.replace(/\/$/, "")}/${value.replace(/^\//, "")}`;
+  if (value.startsWith("http")) {
+    const url = new URL(value);
+    return getApiUrl(`${url.pathname}${url.search}${url.hash}`);
+  }
+
+  return getApiUrl(value);
 };
 
 const normalizeStems = (payload: unknown): StemTrack[] => {
@@ -174,9 +204,7 @@ const parseJobStatus = (payload: unknown): JobStatusResponse => {
 };
 
 const fetchJobStatus = async (jobId: string): Promise<JobStatusResponse> => {
-  const response = await fetch(
-    `${API_BASE.replace(/\/$/, "")}/get-job-status/${jobId}`,
-  );
+  const response = await fetch(getApiUrl(`/get-job-status/${jobId}`));
 
   if (!response.ok) {
     throw new Error(`Status check failed with status ${response.status}.`);
@@ -234,6 +262,8 @@ export default function App() {
   const [stems, setStems] = useState<StemTrack[]>([]);
   const [jobId, setJobId] = useState<string | null>(null);
   const [volumes, setVolumes] = useState<Record<string, number>>({});
+  const [playbackTime, setPlaybackTime] = useState(0);
+  const [playbackDuration, setPlaybackDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
 
@@ -257,19 +287,35 @@ export default function App() {
     { label: "Mix", active: status === "complete" },
   ];
 
+  const getStemPlayers = useCallback(
+    () =>
+      stems
+        .map((stem) => audioRefs.current[stem.id])
+        .filter((player): player is HTMLAudioElement => player !== null),
+    [stems],
+  );
+
+  const syncPlaybackPosition = useCallback((player: HTMLAudioElement) => {
+    setPlaybackTime(player.currentTime);
+
+    if (Number.isFinite(player.duration)) {
+      setPlaybackDuration(player.duration);
+    }
+  }, []);
+
   useEffect(() => {
     const interval = window.setInterval(() => {
       if (!isPlaying || stems.length === 0) {
         return;
       }
 
-      const players = stems
-        .map((stem) => audioRefs.current[stem.id])
-        .filter((player): player is HTMLAudioElement => player !== null);
+      const players = getStemPlayers();
       const leader = players[0];
       if (!leader) {
         return;
       }
+
+      syncPlaybackPosition(leader);
 
       for (const player of players.slice(1)) {
         if (Math.abs(player.currentTime - leader.currentTime) > 0.12) {
@@ -279,13 +325,15 @@ export default function App() {
     }, 500);
 
     return () => window.clearInterval(interval);
-  }, [isPlaying, stems]);
+  }, [getStemPlayers, isPlaying, stems.length, syncPlaybackPosition]);
 
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0] ?? null;
     setError("");
     setStems([]);
     setJobId(null);
+    setPlaybackTime(0);
+    setPlaybackDuration(0);
     setIsPlaying(false);
 
     if (!selectedFile) {
@@ -340,6 +388,8 @@ export default function App() {
     setStatus("processing");
     setError("");
     setStems([]);
+    setPlaybackTime(0);
+    setPlaybackDuration(0);
     setIsPlaying(false);
 
     const nextJobId = createJobId();
@@ -348,13 +398,10 @@ export default function App() {
 
     try {
       setJobId(nextJobId);
-      const response = await fetch(
-        `${API_BASE.replace(/\/$/, "")}/stem/${nextJobId}`,
-        {
-          method: "POST",
-          body: formData,
-        },
-      );
+      const response = await fetch(getApiUrl(`/stem/${nextJobId}`), {
+        method: "POST",
+        body: formData,
+      });
 
       if (!response.ok) {
         throw new Error(`Stem request failed with status ${response.status}.`);
@@ -369,6 +416,8 @@ export default function App() {
 
       setStems(nextStems);
       setVolumes(Object.fromEntries(nextStems.map((stem) => [stem.id, 1])));
+      setPlaybackTime(0);
+      setPlaybackDuration(0);
       setStatus("complete");
     } catch (requestError) {
       setStatus("error");
@@ -391,15 +440,15 @@ export default function App() {
     setError("");
     setStems([]);
     setJobId(null);
+    setPlaybackTime(0);
+    setPlaybackDuration(0);
     setVolumes({});
     setIsPlaying(false);
     audioRefs.current = {};
   };
 
   const togglePlayback = async () => {
-    const players = stems
-      .map((stem) => audioRefs.current[stem.id])
-      .filter((player): player is HTMLAudioElement => player !== null);
+    const players = getStemPlayers();
     const leader = players[0];
 
     if (!leader) {
@@ -435,12 +484,23 @@ export default function App() {
   };
 
   const handleTrackEnded = () => {
-    const players = stems
-      .map((stem) => audioRefs.current[stem.id])
-      .filter((player): player is HTMLAudioElement => player !== null);
+    const players = getStemPlayers();
     if (players.every((player) => player.ended || player.paused)) {
       setIsPlaying(false);
     }
+  };
+
+  const seekPlayback = (nextTime: number) => {
+    const safeTime = Math.min(
+      Math.max(nextTime, 0),
+      playbackDuration || nextTime,
+    );
+
+    for (const player of getStemPlayers()) {
+      player.currentTime = safeTime;
+    }
+
+    setPlaybackTime(safeTime);
   };
 
   return (
@@ -546,6 +606,29 @@ export default function App() {
               </span>
             </div>
 
+            <label className="seek-card">
+              <span>{formatPlaybackTime(playbackTime)}</span>
+              <input
+                type="range"
+                min="0"
+                max={playbackDuration || 0}
+                step="0.01"
+                value={Math.min(playbackTime, playbackDuration || playbackTime)}
+                disabled={playbackDuration === 0}
+                onChange={(event) => seekPlayback(Number(event.target.value))}
+                style={
+                  {
+                    "--seek": `${
+                      playbackDuration > 0
+                        ? Math.min((playbackTime / playbackDuration) * 100, 100)
+                        : 0
+                    }%`,
+                  } as CSSProperties
+                }
+              />
+              <span>{formatPlaybackTime(playbackDuration)}</span>
+            </label>
+
             <div className="stem-list">
               {stems.map((stem, index) => (
                 <article
@@ -570,6 +653,14 @@ export default function App() {
                     data-stem-id={stem.id}
                     src={stem.url}
                     preload="auto"
+                    onLoadedMetadata={(event) =>
+                      syncPlaybackPosition(event.currentTarget)
+                    }
+                    onTimeUpdate={(event) => {
+                      if (index === 0) {
+                        syncPlaybackPosition(event.currentTarget);
+                      }
+                    }}
                     onEnded={handleTrackEnded}
                   />
                   <label className="volume-control">
@@ -601,7 +692,7 @@ export default function App() {
               {jobId ? (
                 <a
                   className="secondary-button"
-                  href={`${API_BASE.replace(/\/$/, "")}/get-stems/${jobId}`}
+                  href={getApiUrl(`/get-stems/${jobId}`)}
                 >
                   Download stems zip
                 </a>
