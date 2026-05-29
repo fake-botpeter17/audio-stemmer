@@ -2,23 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ChangeEvent, FormEvent } from "react";
 import "./index.css";
 
-const PUBLIC_API_PORT = "5000";
 
-const getPublicApiBase = () => {
-  const configuredBase = import.meta.env.VITE_API_BASE?.trim();
-
-  if (configuredBase) {
-    return configuredBase.replace(/\/$/, "");
-  }
-
-  if (typeof window === "undefined") {
-    return `http://localhost:${PUBLIC_API_PORT}`;
-  }
-
-  return `${window.location.protocol}//${window.location.hostname}:${PUBLIC_API_PORT}`;
-};
-
-const API_BASE = getPublicApiBase();
+const API_BASE = import.meta.env.VITE_API_BASE?.trim()
 const MAX_DURATION_SECONDS = 60;
 const STEM_ORDER = ["vocals", "drums", "bass", "other"] as const;
 const STATUS_POLL_INTERVAL_MS = 2_000;
