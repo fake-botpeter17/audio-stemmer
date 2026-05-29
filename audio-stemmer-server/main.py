@@ -21,12 +21,32 @@ JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 
 
-def convert_stem_to_mp3(stem_path: str) -> str:
-    """Convert a rendered stem file to MP3 before it is exposed to clients."""
-    source_path = Path(stem_path)
+def mp3_output_path(source_path: Path) -> Path:
+    """Return an MP3 output path that never overwrites the source file."""
     mp3_path = source_path.with_suffix(".mp3")
-    converted = False
+    if mp3_path == source_path:
+        return source_path.with_name(f"{source_path.stem}-converted.mp3")
 
+    return mp3_path
+
+
+def ffmpeg_error_details(error: subprocess.CalledProcessError) -> str:
+    """Extract the most useful ffmpeg error line for API responses."""
+    stderr = error.stderr.decode("utf-8", errors="replace").strip()
+    return stderr.splitlines()[-1] if stderr else "ffmpeg could not read the file."
+
+
+def convert_to_mp3(source: str | Path, mp3_path: str | Path | None = None) -> str:
+    """Convert an audio file to MP3 and return the converted file path."""
+    source_path = Path(source)
+    output_path = (
+        Path(mp3_path) if mp3_path is not None else mp3_output_path(source_path)
+    )
+    if output_path == source_path:
+        msg = "MP3 output path must be different from the source path."
+        raise RuntimeError(msg)
+
+    converted = False
     try:
         subprocess.run(
             [
@@ -39,7 +59,7 @@ def convert_stem_to_mp3(stem_path: str) -> str:
                 "libmp3lame",
                 "-b:a",
                 "320k",
-                str(mp3_path),
+                str(output_path),
             ],
             check=True,
             capture_output=True,
@@ -47,25 +67,25 @@ def convert_stem_to_mp3(stem_path: str) -> str:
         )
         converted = True
     except FileNotFoundError as error:
-        msg = "ffmpeg is required to convert stems to MP3 before download."
+        msg = "ffmpeg is required to convert audio to MP3."
         raise RuntimeError(msg) from error
     except subprocess.TimeoutExpired as error:
         msg = f"Timed out while converting {source_path.name} to MP3."
         raise RuntimeError(msg) from error
     except subprocess.CalledProcessError as error:
-        stderr = error.stderr.decode("utf-8", errors="replace").strip()
-        details = (
-            stderr.splitlines()[-1]
-            if stderr
-            else "ffmpeg could not read the stem file."
-        )
+        details = ffmpeg_error_details(error)
         msg = f"Unable to convert {source_path.name} to MP3: {details}"
         raise RuntimeError(msg) from error
     finally:
         if not converted:
-            mp3_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
 
-    return str(mp3_path)
+    return str(output_path)
+
+
+def convert_stem_to_mp3(stem_path: str) -> str:
+    """Convert a rendered stem file to MP3 before it is exposed to clients."""
+    return convert_to_mp3(stem_path)
 
 
 def convert_stems_to_mp3(rendered_stems: dict[str, str]) -> dict[str, str]:
@@ -120,7 +140,7 @@ def stem_audio(job_id: str):
             {"error": "Upload an audio file using the 'audio' form field."}
         ), 400
 
-    suffix = Path(secure_filename(audio.filename)).suffix or ".mp3"
+    suffix = Path(secure_filename(audio.filename or "")).suffix or ".mp3"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as file_handle:
         audio.save(file_handle.name)
         audio_path = file_handle.name
