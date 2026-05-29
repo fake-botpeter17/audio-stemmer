@@ -405,6 +405,32 @@ h1 {
   color: var(--muted);
 }
 
+.job-chip {
+  display: inline-flex;
+  max-width: 260px;
+  padding: 6px 10px;
+  overflow: hidden;
+  font-size: 0.76rem;
+  font-weight: 800;
+  color: #d8ccff;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: rgba(157, 124, 255, 0.12);
+  border: 1px solid rgba(157, 124, 255, 0.28);
+  border-radius: 999px;
+}
+
+.result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: center;
+}
+
+a.secondary-button {
+  text-decoration: none;
+}
+
 .play-glyph {
   display: inline-grid;
   width: 26px;
