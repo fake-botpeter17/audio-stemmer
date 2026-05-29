@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, ChangeEvent, FormEvent } from 'react'
+import "./index.css"
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:5000'
 const MAX_DURATION_SECONDS = 60
@@ -314,7 +315,7 @@ export default function App() {
 
         <div className="eyebrow">
           <span className="eyebrow-dot" />
-          Demucs powered stem separation
+          AI powered stem separation
         </div>
         <h1 id="page-title">Split any short clip into four mix-ready stems.</h1>
         <p className="hero-copy">
@@ -430,7 +431,7 @@ export default function App() {
           <div className="processing-card" role="status" aria-live="polite">
             <div className="loader" />
             <div>
-              <strong>Demucs is listening closely…</strong>
+              <strong>StemmerAI is listening closely…</strong>
               <span>
                 This can take a little while. Keep this tab open while the backend renders each stem.
               </span>
