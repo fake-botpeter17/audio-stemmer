@@ -18,3 +18,11 @@ dev = [
  "mypy>=1.0.0",
  "pytest>=7.0.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["node_modules", "frontend/node_modules", ".venv", "audio-stemmer-server/.venv"]
+
+[[tool.mypy.overrides]]
+module = ["flask_cors"]
+ignore_missing_imports = true
