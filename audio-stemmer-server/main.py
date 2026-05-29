@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import threading
 import zipfile
@@ -14,8 +15,65 @@ app = Flask(__name__)
 CORS(app)
 
 STEM_NAMES = ("vocals", "drums", "bass", "other")
+FFMPEG_TIMEOUT_SECONDS = 120
+MP3_CONTENT_TYPE = "audio/mpeg"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+
+
+def convert_stem_to_mp3(stem_path: str) -> str:
+    """Convert a rendered stem file to MP3 before it is exposed to clients."""
+    source_path = Path(stem_path)
+    mp3_path = source_path.with_suffix(".mp3")
+    converted = False
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(source_path),
+                "-vn",
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                "320k",
+                str(mp3_path),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
+        )
+        converted = True
+    except FileNotFoundError as error:
+        msg = "ffmpeg is required to convert stems to MP3 before download."
+        raise RuntimeError(msg) from error
+    except subprocess.TimeoutExpired as error:
+        msg = f"Timed out while converting {source_path.name} to MP3."
+        raise RuntimeError(msg) from error
+    except subprocess.CalledProcessError as error:
+        stderr = error.stderr.decode("utf-8", errors="replace").strip()
+        details = (
+            stderr.splitlines()[-1]
+            if stderr
+            else "ffmpeg could not read the stem file."
+        )
+        msg = f"Unable to convert {source_path.name} to MP3: {details}"
+        raise RuntimeError(msg) from error
+    finally:
+        if not converted:
+            mp3_path.unlink(missing_ok=True)
+
+    return str(mp3_path)
+
+
+def convert_stems_to_mp3(rendered_stems: dict[str, str]) -> dict[str, str]:
+    """Convert all rendered stems to downloadable MP3 files."""
+    return {
+        stem_name: convert_stem_to_mp3(stem_path)
+        for stem_name, stem_path in rendered_stems.items()
+    }
 
 
 def set_job(job_id: str, **updates: Any) -> None:
@@ -43,10 +101,11 @@ def process_stems(job_id: str, audio_path: str) -> None:
     try:
         audio = Audio(audio_path)
         rendered_stems = audio.get_stems(device=get_default_device(), save=True)
+        downloadable_stems = convert_stems_to_mp3(rendered_stems)
         set_job(
             job_id,
             status="complete",
-            stems=rendered_stems,
+            stems=downloadable_stems,
             stem_urls=build_stem_urls(job_id),
         )
     except Exception as exc:  # noqa: BLE001 - surface worker failures through job status.
@@ -112,7 +171,9 @@ def get_stem(job_id: str, stem_name: str):
     if not stem_path or not Path(stem_path).exists():
         return jsonify({"error": "Stem file not found."}), 404
 
-    return send_file(stem_path, mimetype="audio/wav", download_name=f"{stem_name}.wav")
+    return send_file(
+        stem_path, mimetype=MP3_CONTENT_TYPE, download_name=f"{stem_name}.mp3"
+    )
 
 
 @app.route("/get-stems/<job_id>")
@@ -129,7 +190,7 @@ def get_stems(job_id: str):
         for stem_name, stem_path in job.get("stems", {}).items():
             stem_file = Path(stem_path)
             if stem_file.exists():
-                archive.write(stem_file, arcname=f"{stem_name}.wav")
+                archive.write(stem_file, arcname=f"{stem_name}.mp3")
 
     return send_file(zip_path, as_attachment=True, download_name="stems.zip")
 
