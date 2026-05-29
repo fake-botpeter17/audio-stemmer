@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ChangeEvent, FormEvent } from "react";
 import "./index.css";
 
-
-const API_BASE = import.meta.env.VITE_API_BASE?.trim()
+const API_BASE = (import.meta.env.VITE_API_BASE?.trim() ?? "").replace(
+  /\/$/,
+  "",
+);
 const MAX_DURATION_SECONDS = 60;
 const STEM_ORDER = ["vocals", "drums", "bass", "other"] as const;
 const STATUS_POLL_INTERVAL_MS = 2_000;
@@ -22,6 +24,7 @@ type UploadStatus =
   | "ready"
   | "queued"
   | "processing"
+  | "downloading"
   | "complete"
   | "error";
 type JobStatus = "queued" | "processing" | "complete" | "error";
@@ -61,7 +64,10 @@ const formatPlaybackTime = (seconds: number) => {
     .padStart(2, "0")}`;
 };
 
-const getApiUrl = (path: string) => `${API_BASE}/${path.replace(/^\//, "")}`;
+const getApiUrl = (path: string) => {
+  const normalizedPath = path.replace(/^\//, "");
+  return API_BASE ? `${API_BASE}/${normalizedPath}` : `/${normalizedPath}`;
+};
 
 const extractUrl = (value: unknown): string | null => {
   if (typeof value === "string") {
@@ -251,6 +257,52 @@ export default function App() {
   const [playbackDuration, setPlaybackDuration] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
+  const stemObjectUrls = useRef<string[]>([]);
+
+  const releaseDownloadedStemUrls = useCallback(() => {
+    for (const objectUrl of stemObjectUrls.current) {
+      URL.revokeObjectURL(objectUrl);
+    }
+
+    stemObjectUrls.current = [];
+  }, []);
+
+  useEffect(() => releaseDownloadedStemUrls, [releaseDownloadedStemUrls]);
+
+  const downloadStemAudio = useCallback(
+    async (tracks: StemTrack[]) => {
+      const downloadedUrls: string[] = [];
+
+      try {
+        const downloadedTracks = await Promise.all(
+          tracks.map(async (track) => {
+            const response = await fetch(track.url);
+
+            if (!response.ok) {
+              throw new Error(
+                `Could not download ${track.name} with status ${response.status}.`,
+              );
+            }
+
+            const objectUrl = URL.createObjectURL(await response.blob());
+            downloadedUrls.push(objectUrl);
+            return { ...track, url: objectUrl };
+          }),
+        );
+
+        releaseDownloadedStemUrls();
+        stemObjectUrls.current = downloadedUrls;
+        return downloadedTracks;
+      } catch (downloadError) {
+        for (const objectUrl of downloadedUrls) {
+          URL.revokeObjectURL(objectUrl);
+        }
+
+        throw downloadError;
+      }
+    },
+    [releaseDownloadedStemUrls],
+  );
 
   const durationLabel = useMemo(() => {
     if (duration === null || Number.isNaN(duration)) {
@@ -267,7 +319,14 @@ export default function App() {
     {
       label: "Separate",
       active:
-        status === "queued" || status === "processing" || status === "complete",
+        status === "queued" ||
+        status === "processing" ||
+        status === "downloading" ||
+        status === "complete",
+    },
+    {
+      label: "Download",
+      active: status === "downloading" || status === "complete",
     },
     { label: "Mix", active: status === "complete" },
   ];
@@ -315,6 +374,7 @@ export default function App() {
   const handleFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0] ?? null;
     setError("");
+    releaseDownloadedStemUrls();
     setStems([]);
     setJobId(null);
     setPlaybackTime(0);
@@ -372,6 +432,7 @@ export default function App() {
 
     setStatus("processing");
     setError("");
+    releaseDownloadedStemUrls();
     setStems([]);
     setPlaybackTime(0);
     setPlaybackDuration(0);
@@ -399,8 +460,11 @@ export default function App() {
         throw new Error("The backend did not return four playable stems.");
       }
 
-      setStems(nextStems);
-      setVolumes(Object.fromEntries(nextStems.map((stem) => [stem.id, 1])));
+      setStatus("downloading");
+      const playableStems = await downloadStemAudio(nextStems);
+
+      setStems(playableStems);
+      setVolumes(Object.fromEntries(playableStems.map((stem) => [stem.id, 1])));
       setPlaybackTime(0);
       setPlaybackDuration(0);
       setStatus("complete");
@@ -423,6 +487,7 @@ export default function App() {
     setDuration(null);
     setStatus("idle");
     setError("");
+    releaseDownloadedStemUrls();
     setStems([]);
     setJobId(null);
     setPlaybackTime(0);
@@ -432,11 +497,14 @@ export default function App() {
     audioRefs.current = {};
   };
 
+  const isBusy =
+    status === "queued" || status === "processing" || status === "downloading";
+
   const togglePlayback = async () => {
     const players = getStemPlayers();
     const leader = players[0];
 
-    if (!leader) {
+    if (status !== "complete" || !leader) {
       return;
     }
 
@@ -524,7 +592,7 @@ export default function App() {
                 type="file"
                 accept="audio/*"
                 onChange={handleFileChange}
-                disabled={status === "queued" || status === "processing"}
+                disabled={isBusy}
               />
               <span className="drop-icon">♫</span>
               <strong>{file ? file.name : "Drop in an audio clip"}</strong>
@@ -557,11 +625,9 @@ export default function App() {
             <button
               className="primary-button"
               type="submit"
-              disabled={!file || status === "queued" || status === "processing"}
+              disabled={!file || isBusy}
             >
-              {status === "queued" || status === "processing"
-                ? "Separating stems…"
-                : "Stem audio"}
+              {isBusy ? "Preparing stems…" : "Stem audio"}
             </button>
           </form>
         ) : (
@@ -571,6 +637,7 @@ export default function App() {
                 className="play-button"
                 type="button"
                 onClick={togglePlayback}
+                disabled={status !== "complete"}
               >
                 <span className="play-glyph">{isPlaying ? "Ⅱ" : "▶"}</span>
                 <span>{isPlaying ? "Pause all" : "Play all"}</span>
@@ -693,15 +760,19 @@ export default function App() {
           </section>
         )}
 
-        {status === "queued" || status === "processing" ? (
+        {isBusy ? (
           <div className="processing-card" role="status" aria-live="polite">
             <div className="loader" />
             <div>
-              <strong>StemmerAI is listening closely…</strong>
+              <strong>
+                {status === "downloading"
+                  ? "Downloading stems for playback…"
+                  : "StemmerAI is listening closely…"}
+              </strong>
               <span>
-                Job {jobId?.slice(0, 8) ?? "pending"} is running in the
-                background. Keep this tab open while the backend renders each
-                stem.
+                {status === "downloading"
+                  ? "The stems are ready. We are downloading them now and will unlock playback once all four tracks are local."
+                  : `Job ${jobId?.slice(0, 8) ?? "pending"} is running in the background. Keep this tab open while the backend renders each stem.`}
               </span>
             </div>
           </div>

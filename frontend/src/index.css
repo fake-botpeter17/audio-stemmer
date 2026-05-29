@@ -203,7 +203,7 @@ h1 {
 
 .status-rail {
   display: inline-grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 6px;
   padding: 6px;
   margin-top: 26px;
@@ -368,7 +368,7 @@ h1 {
 
 .primary-button:not(:disabled):hover,
 .secondary-button:hover,
-.play-button:hover {
+.play-button:not(:disabled):hover {
   box-shadow: 0 22px 52px rgba(255, 122, 217, 0.25);
   transform: translateY(-2px);
 }
