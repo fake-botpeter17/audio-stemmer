@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+import logging
 from os import getenv
 from pathlib import Path
 import subprocess
@@ -14,6 +15,12 @@ from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("audio_stemmer.public")
 
 PRIVATE_API_URL = (getenv("PRIVATE_API") or "").rstrip("/")
 REQUEST_TIMEOUT_SECONDS = 30
@@ -36,12 +43,23 @@ HOP_BY_HOP_HEADERS = {
 stemmer_bp = Blueprint("stemmer_bp", __name__)
 
 
+def file_size(path: str | Path) -> int | None:
+    """Return a file size in bytes when the file exists and can be read."""
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return None
+
+
 def private_api_url(path: str) -> str | None:
     """Build a private API URL, or return None when the service is not configured."""
     if not PRIVATE_API_URL:
+        logger.warning("Private API URL is not configured for path=%s", path)
         return None
 
-    return f"{PRIVATE_API_URL}/{path.lstrip('/')}"
+    url = f"{PRIVATE_API_URL}/{path.lstrip('/')}"
+    logger.info("Built private API URL: path=%s url=%s", path, url)
+    return url
 
 
 def private_api_not_configured() -> tuple[Response, int]:
@@ -58,6 +76,12 @@ def proxy_headers(response: RequestsResponse) -> dict[str, str]:
 
 
 def proxy_response(response: RequestsResponse) -> Response:
+    logger.info(
+        "Proxying private response: status=%s content_type=%s bytes=%s",
+        response.status_code,
+        response.headers.get("content-type"),
+        len(response.content),
+    )
     return Response(
         response.content,
         status=response.status_code,
@@ -67,11 +91,20 @@ def proxy_response(response: RequestsResponse) -> Response:
 
 
 def stream_proxy_response(response: RequestsResponse) -> Response:
+    logger.info(
+        "Streaming private response: status=%s content_type=%s",
+        response.status_code,
+        response.headers.get("content-type"),
+    )
+
     def generate() -> Iterator[bytes]:
+        streamed_bytes = 0
         with response:
             for chunk in response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
                 if chunk:
+                    streamed_bytes += len(chunk)
                     yield chunk
+        logger.info("Finished streaming private response: bytes=%s", streamed_bytes)
 
     return Response(
         stream_with_context(generate()),
@@ -82,10 +115,12 @@ def stream_proxy_response(response: RequestsResponse) -> Response:
 
 
 def proxy_request_error(error: requests.RequestException) -> tuple[Response, int]:
+    logger.exception("Unable to reach private stemmer API")
     return jsonify({"error": f"Unable to reach private stemmer API: {error}"}), 502
 
 
 def conversion_error(message: str) -> tuple[Response, int]:
+    logger.warning("Upload conversion failed: %s", message)
     return jsonify({"error": message}), 422
 
 
@@ -97,6 +132,11 @@ def upload_suffix(audio: FileStorage) -> str:
 
 def convert_upload_to_mp3(audio: FileStorage) -> Path:
     """Transcode an uploaded audio file to an MP3 temp file for the private API."""
+    logger.info(
+        "Preparing upload conversion: filename=%s content_type=%s",
+        audio.filename,
+        audio.content_type,
+    )
     source_file = tempfile.NamedTemporaryFile(suffix=upload_suffix(audio), delete=False)
     mp3_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     source_path = Path(source_file.name)
@@ -107,6 +147,12 @@ def convert_upload_to_mp3(audio: FileStorage) -> Path:
     converted = False
     try:
         audio.save(source_path)
+        logger.info(
+            "Saved upload for MP3 conversion: source=%s source_size=%s mp3_output=%s",
+            source_path,
+            file_size(source_path),
+            mp3_path,
+        )
         subprocess.run(
             [
                 "ffmpeg",
@@ -125,10 +171,21 @@ def convert_upload_to_mp3(audio: FileStorage) -> Path:
             timeout=FFMPEG_TIMEOUT_SECONDS,
         )
         converted = True
+        logger.info(
+            "Upload MP3 conversion complete: mp3_path=%s mp3_size=%s",
+            mp3_path,
+            file_size(mp3_path),
+        )
     except FileNotFoundError as error:
+        logger.exception(
+            "ffmpeg was not found while converting upload source=%s", source_path
+        )
         msg = "ffmpeg is required to convert uploads to MP3 before stemming."
         raise RuntimeError(msg) from error
     except subprocess.TimeoutExpired as error:
+        logger.exception(
+            "Timed out converting upload source=%s output=%s", source_path, mp3_path
+        )
         msg = "Timed out while converting the upload to MP3."
         raise RuntimeError(msg) from error
     except subprocess.CalledProcessError as error:
@@ -136,11 +193,19 @@ def convert_upload_to_mp3(audio: FileStorage) -> Path:
         details = (
             stderr.splitlines()[-1] if stderr else "ffmpeg could not read the file."
         )
+        logger.exception(
+            "ffmpeg failed converting upload source=%s output=%s details=%s",
+            source_path,
+            mp3_path,
+            details,
+        )
         msg = f"Unable to convert the upload to MP3: {details}"
         raise RuntimeError(msg) from error
     finally:
+        logger.info("Removing temporary upload source: source=%s", source_path)
         source_path.unlink(missing_ok=True)
         if not converted:
+            logger.info("Removing failed MP3 output: mp3_path=%s", mp3_path)
             mp3_path.unlink(missing_ok=True)
 
     return mp3_path
@@ -150,6 +215,11 @@ def normalize_stem_urls(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Ensure completed job payloads point clients back at the public API."""
     stems = payload.get("stems")
     if isinstance(stems, dict):
+        logger.info(
+            "Normalizing stem URLs for public client: job_id=%s stems=%s",
+            job_id,
+            sorted(stems),
+        )
         payload["stems"] = {
             stem_name: f"/get-stem/{job_id}/{stem_name}" for stem_name in stems
         }
@@ -158,6 +228,7 @@ def normalize_stem_urls(job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def forward_stem_request(job_id: str) -> Response | tuple[Response, int]:
+    logger.info("Received public stem request: job_id=%s", job_id)
     audio = request.files.get("audio")
     if audio is None or audio.filename == "":
         return jsonify(
@@ -171,15 +242,33 @@ def forward_stem_request(job_id: str) -> Response | tuple[Response, int]:
     converted_path: Path | None = None
     try:
         converted_path = convert_upload_to_mp3(audio)
+        logger.info(
+            "Forwarding MP3 upload to private API: job_id=%s url=%s mp3_path=%s mp3_size=%s",
+            job_id,
+            url,
+            converted_path,
+            file_size(converted_path),
+        )
         with converted_path.open("rb") as mp3_stream:
             files = {"audio": (f"{job_id}.mp3", mp3_stream, MP3_CONTENT_TYPE)}
             response = requests.post(url, files=files, timeout=REQUEST_TIMEOUT_SECONDS)
+        logger.info(
+            "Private stem request completed: job_id=%s status=%s content_type=%s",
+            job_id,
+            response.status_code,
+            response.headers.get("content-type"),
+        )
     except RuntimeError as error:
         return conversion_error(str(error))
     except requests.RequestException as error:
         return proxy_request_error(error)
     finally:
         if converted_path is not None:
+            logger.info(
+                "Removing forwarded MP3 temp file: job_id=%s mp3_path=%s",
+                job_id,
+                converted_path,
+            )
             converted_path.unlink(missing_ok=True)
 
     return proxy_response(response)
@@ -197,12 +286,19 @@ def stem_audio(job_id: str):
 
 @stemmer_bp.route("/get-job-status/<job_id>")
 def get_job_status(job_id: str):
+    logger.info("Public job status requested: job_id=%s", job_id)
     url = private_api_url(f"/get-job-status/{job_id}")
     if url is None:
         return private_api_not_configured()
 
     try:
         response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+        logger.info(
+            "Private job status completed: job_id=%s status=%s content_type=%s",
+            job_id,
+            response.status_code,
+            response.headers.get("content-type"),
+        )
     except requests.RequestException as error:
         return proxy_request_error(error)
 
@@ -224,26 +320,51 @@ def check_job_status(job_id: str):
 
 @stemmer_bp.route("/get-stem/<job_id>/<stem_name>")
 def get_stem(job_id: str, stem_name: str):
+    logger.info("Public stem download requested: job_id=%s stem=%s", job_id, stem_name)
     url = private_api_url(f"/get-stem/{job_id}/{stem_name}")
     if url is None:
         return private_api_not_configured()
 
     try:
         response = requests.get(url, stream=True, timeout=REQUEST_TIMEOUT_SECONDS)
+        logger.info(
+            "Private stem download response: job_id=%s stem=%s status=%s content_type=%s",
+            job_id,
+            stem_name,
+            response.status_code,
+            response.headers.get("content-type"),
+        )
     except requests.RequestException as error:
         return proxy_request_error(error)
+
+    if response.ok and "audio/mpeg" not in response.headers.get("content-type", ""):
+        logger.error(
+            "Private API returned a non-MP3 stem response: job_id=%s stem=%s content_type=%s",
+            job_id,
+            stem_name,
+            response.headers.get("content-type"),
+        )
+        response.close()
+        return jsonify({"error": "Private API did not return an MP3 stem."}), 502
 
     return stream_proxy_response(response)
 
 
 @stemmer_bp.route("/get-stems/<job_id>")
 def get_stems(job_id: str):
+    logger.info("Public stem archive requested: job_id=%s", job_id)
     url = private_api_url(f"/get-stems/{job_id}")
     if url is None:
         return private_api_not_configured()
 
     try:
         response = requests.get(url, stream=True, timeout=REQUEST_TIMEOUT_SECONDS)
+        logger.info(
+            "Private stem archive response: job_id=%s status=%s content_type=%s",
+            job_id,
+            response.status_code,
+            response.headers.get("content-type"),
+        )
     except requests.RequestException as error:
         return proxy_request_error(error)
 
