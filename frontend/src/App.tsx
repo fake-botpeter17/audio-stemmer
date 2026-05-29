@@ -23,6 +23,14 @@ const labelStem = (name: string) =>
     .replace(/[_-]+/g, ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase())
 
+const formatBytes = (bytes: number) => {
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`
+  }
+
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
 const extractUrl = (value: unknown): string | null => {
   if (typeof value === 'string') {
     return value
@@ -116,6 +124,12 @@ export default function App() {
 
     return `${Math.floor(duration / 60)}:${Math.floor(duration % 60).toString().padStart(2, '0')}`
   }, [duration])
+
+  const statusSteps = [
+    { label: 'Upload', active: file !== null || status === 'complete' },
+    { label: 'Separate', active: status === 'processing' || status === 'complete' },
+    { label: 'Mix', active: status === 'complete' },
+  ]
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -293,14 +307,28 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell app-shell--${status}`}>
       <section className="hero-card" aria-labelledby="page-title">
-        <div className="eyebrow">Demucs powered stem separation</div>
+        <div className="orb orb--left" />
+        <div className="orb orb--right" />
+
+        <div className="eyebrow">
+          <span className="eyebrow-dot" />
+          Demucs powered stem separation
+        </div>
         <h1 id="page-title">Split any short clip into four mix-ready stems.</h1>
         <p className="hero-copy">
           Upload a clip up to one minute long, send it to the stemmer, then audition the separated
           tracks in sync with individual fades.
         </p>
+
+        <div className="status-rail" aria-label="Stem separation progress">
+          {statusSteps.map((step) => (
+            <span className={step.active ? 'status-pill status-pill--active' : 'status-pill'} key={step.label}>
+              {step.label}
+            </span>
+          ))}
+        </div>
 
         {status !== 'complete' ? (
           <form className="upload-panel" onSubmit={handleStemAudio}>
@@ -314,6 +342,24 @@ export default function App() {
               <span className="drop-icon">♫</span>
               <strong>{file ? file.name : 'Drop in an audio clip'}</strong>
               <small>{file ? `${durationLabel} selected` : 'WAV, MP3, M4A, FLAC • 60 seconds max'}</small>
+              <span className="wave-preview" aria-hidden="true">
+                {Array.from({ length: 22 }).map((_, index) => (
+                  <span
+                    key={index}
+                    style={
+                      {
+                        '--bar': index,
+                        '--bar-height': `${18 + (index % 6) * 7}px`,
+                      } as CSSProperties
+                    }
+                  />
+                ))}
+              </span>
+              {file ? (
+                <span className="file-chip">
+                  Ready to stem • {formatBytes(file.size)} • {file.type || 'audio'}
+                </span>
+              ) : null}
             </label>
 
             <button className="primary-button" type="submit" disabled={!file || status === 'processing'}>
@@ -324,17 +370,27 @@ export default function App() {
           <section className="stems-panel" aria-label="Separated stems">
             <div className="transport-card">
               <button className="play-button" type="button" onClick={togglePlayback}>
+                <span className="play-glyph">{isPlaying ? 'Ⅱ' : '▶'}</span>
                 <span>{isPlaying ? 'Pause all' : 'Play all'}</span>
               </button>
               <p>All four stems launch together and stay synchronized while you blend the mix.</p>
+              <span className={isPlaying ? 'live-badge live-badge--on' : 'live-badge'}>
+                {isPlaying ? 'Live mix' : 'Ready'}
+              </span>
             </div>
 
             <div className="stem-list">
               {stems.map((stem, index) => (
                 <article className="stem-card" key={stem.id} style={{ animationDelay: `${index * 90}ms` }}>
-                  <div>
+                  <div className="stem-heading">
                     <span className="stem-number">0{index + 1}</span>
                     <h2>{stem.name}</h2>
+                    <span className="stem-meter" aria-hidden="true">
+                      <span />
+                      <span />
+                      <span />
+                      <span />
+                    </span>
                   </div>
                   <audio
                     ref={(element) => {
